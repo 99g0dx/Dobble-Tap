@@ -1,0 +1,957 @@
+# Dobble Tap Full Webapp Codebase (Integrated UI & Schema)
+
+---
+
+## 1. Cloudinary Configuration
+
+```typescript name=server/config/cloudinary.ts
+import { v2 as cloudinary } from 'cloudinary';
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+export default cloudinary;
+```
+
+---
+
+## 2. Resend Configuration
+
+```typescript name=server/config/resend.ts
+import { Resend } from 'resend';
+
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+export default resend;
+```
+
+---
+
+## 3. Paystack Configuration
+
+```typescript name=server/config/paystack.ts
+import axios from 'axios';
+
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+
+if (!PAYSTACK_SECRET_KEY) {
+  throw new Error('PAYSTACK_SECRET_KEY is not set in environment variables');
+}
+
+export const paystackApi = axios.create({
+  baseURL: 'https://api.paystack.co',
+  headers: {
+    Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+    'Content-Type': 'application/json',
+  },
+});
+```
+
+---
+
+## 4. Sentry Configuration
+
+```typescript name=server/config/sentry.ts
+import * as Sentry from '@sentry/node';
+
+Sentry.init({
+  dsn: process.env.SENTRY_DSN,
+  tracesSampleRate: 1.0,
+  environment: process.env.NODE_ENV,
+});
+
+export default Sentry;
+```
+
+---
+
+## 5. Drizzle Schema (pgTable, zod)
+
+```typescript name=server/db/schema.ts
+import { pgTable, text, serial, integer, boolean, timestamp, decimal, jsonb } from "drizzle-orm/pg-core";
+import { createInsertSchema } from "drizzle-zod";
+import { z } from "zod";
+
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  username: text("username").notNull().unique(),
+  email: text("email").notNull().unique(),
+  password: text("password").notNull(),
+  name: text("name").notNull(),
+  avatar: text("avatar"),
+  balance: decimal("balance", { precision: 10, scale: 2 }).notNull().default("0.00"),
+  totalEarnings: decimal("total_earnings", { precision: 10, scale: 2 }).notNull().default("0.00"),
+  completedCampaigns: integer("completed_campaigns").notNull().default(0),
+  activeCampaigns: integer("active_campaigns").notNull().default(0),
+  referrals: integer("referrals").notNull().default(0),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+export const campaigns = pgTable("campaigns", {
+  id: serial("id").primaryKey(),
+  title: text("title").notNull(),
+  description: text("description").notNull(),
+  brandName: text("brand_name").notNull(),
+  brandLogo: text("brand_logo"),
+  reward: decimal("reward", { precision: 10, scale: 2 }).notNull(),
+  status: text("status").notNull().default("active"), // active, completed, paused
+  dueDate: timestamp("due_date").notNull(),
+  progress: integer("progress").notNull().default(0),
+  requirements: jsonb("requirements"),
+  userId: integer("user_id").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+export const payments = pgTable("payments", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").references(() => users.id).notNull(),
+  amount: decimal("amount", { precision: 10, scale: 2 }).notNull(),
+  type: text("type").notNull(), // payment, withdrawal
+  status: text("status").notNull().default("pending"), // pending, completed, failed
+  reference: text("reference").notNull().unique(),
+  transactionId: text("transaction_id"),
+  description: text("description"),
+  paidAt: timestamp("paid_at"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const notifications = pgTable("notifications", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").references(() => users.id).notNull(),
+  title: text("title").notNull(),
+  message: text("message").notNull(),
+  type: text("type").notNull(), // success, info, warning, error
+  read: boolean("read").notNull().default(false),
+  metadata: jsonb("metadata"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+// Zod schemas for validation
+export const insertUserSchema = createInsertSchema(users).pick({
+  username: true,
+  email: true,
+  password: true,
+  name: true,
+});
+
+export const insertCampaignSchema = createInsertSchema(campaigns).pick({
+  title: true,
+  description: true,
+  brandName: true,
+  reward: true,
+  dueDate: true,
+  requirements: true,
+});
+
+export const insertPaymentSchema = createInsertSchema(payments).pick({
+  userId: true,
+  amount: true,
+  type: true,
+  reference: true,
+  description: true,
+});
+
+export const insertNotificationSchema = createInsertSchema(notifications).pick({
+  userId: true,
+  title: true,
+  message: true,
+  type: true,
+  metadata: true,
+});
+
+// Type exports
+export type InsertUser = z.infer<typeof insertUserSchema>;
+export type User = typeof users.$inferSelect;
+export type InsertCampaign = z.infer<typeof insertCampaignSchema>;
+export type Campaign = typeof campaigns.$inferSelect;
+export type InsertPayment = z.infer<typeof insertPaymentSchema>;
+export type Payment = typeof payments.$inferSelect;
+export type InsertNotification = z.infer<typeof insertNotificationSchema>;
+export type Notification = typeof notifications.$inferSelect;
+```
+
+---
+
+## 6. Health Check Route
+
+```typescript name=server/routes/health.ts
+import express from 'express';
+
+const router = express.Router();
+
+router.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date() });
+});
+
+export default router;
+```
+
+---
+
+## 7. Email Service (HTML + Branding)
+
+```typescript name=server/services/emailService.ts
+import resend from '../config/resend';
+
+export async function sendWelcomeEmail(to: string, name: string) {
+  return resend.emails.send({
+    from: 'support@dobbletap.com',
+    to,
+    subject: 'Welcome to Dobble Tap!',
+    html: `
+      <div style="font-family:sans-serif;padding:32px;">
+        <img src="https://dobbletap.com/logo.png" alt="Dobble Tap Logo" style="height:40px;"/>
+        <h1 style="color:#228be6;">Welcome, ${name}!</h1>
+        <p>We're excited to have you on board. Start earning by joining your first campaign!</p>
+        <a href="https://dobbletap.com/login" style="background:#228be6;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;">Get Started</a>
+      </div>
+    `,
+  });
+}
+
+export async function sendPasswordReset(to: string, resetUrl: string) {
+  return resend.emails.send({
+    from: 'support@dobbletap.com',
+    to,
+    subject: 'Password Reset',
+    html: `
+      <div style="font-family:sans-serif;padding:32px;">
+        <h2>Password Reset</h2>
+        <p>Click the button below to reset your password:</p>
+        <a href="${resetUrl}" style="background:#e8590c;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;">Reset Password</a>
+        <p>If you didn't request this, you can ignore this email.</p>
+      </div>
+    `,
+  });
+}
+
+export async function sendPaymentNotification(to: string, amount: number) {
+  return resend.emails.send({
+    from: 'support@dobbletap.com',
+    to,
+    subject: 'Payment Received',
+    html: `
+      <div style="font-family:sans-serif;padding:32px;">
+        <h2 style="color:#51cf66;">Payment Successful!</h2>
+        <p>Your payment of <strong>₦${amount}</strong> was received. Thank you for using Dobble Tap!</p>
+        <a href="https://dobbletap.com/dashboard" style="background:#228be6;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;">View Dashboard</a>
+      </div>
+    `,
+  });
+}
+
+export async function sendSubscriptionUpdate(to: string, planName: string, status: string) {
+  return resend.emails.send({
+    from: 'support@dobbletap.com',
+    to,
+    subject: `Subscription Update: ${planName}`,
+    html: `
+      <div style="font-family:sans-serif;padding:32px;">
+        <h2>Subscription Status</h2>
+        <p>Your subscription to <strong>${planName}</strong> is now <span style="color:#228be6;font-weight:bold;">${status}</span>.</p>
+        <a href="https://dobbletap.com/subscriptions" style="background:#228be6;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;">Manage Subscription</a>
+      </div>
+    `,
+  });
+}
+```
+
+---
+
+## 8. Webhook DB Integration
+
+```typescript name=server/services/paymentService.ts
+import { storage } from '../storage';
+import { sendPaymentNotification } from './emailService';
+
+export async function handlePaystackWebhook(payload: any) {
+  const event = payload.event;
+
+  switch (event) {
+    case "charge.success":
+      await storage.updatePaymentByReference(payload.data.reference, {
+        status: "completed",
+        paidAt: new Date(payload.data.paid_at),
+        transactionId: payload.data.id,
+      });
+      const user = await storage.getUserByEmail(payload.data.customer.email);
+      if (user) await sendPaymentNotification(user.email, payload.data.amount / 100);
+      break;
+    case "transfer.success":
+      await storage.updatePayoutByReference(payload.data.reference, {
+        status: "completed",
+        transactionId: payload.data.id,
+      });
+      break;
+    // Add more events as needed
+  }
+}
+```
+
+---
+
+## 9. Payments Routes (All Payment Flows)
+
+```typescript name=server/routes/payments.ts
+import express from 'express';
+import { paystackApi } from '../config/paystack';
+import crypto from 'crypto';
+import { handlePaystackWebhook } from '../services/paymentService';
+
+const router = express.Router();
+
+router.post('/initialize', async (req, res) => {
+  const { email, amount, metadata } = req.body;
+  if (!email || !amount) return res.status(400).json({ error: 'Email and amount are required' });
+  try {
+    const response = await paystackApi.post('/transaction/initialize', {
+      email,
+      amount: Math.round(amount * 100),
+      metadata,
+    });
+    res.json({
+      authorization_url: response.data.data.authorization_url,
+      access_code: response.data.data.access_code,
+      reference: response.data.data.reference,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      error: 'Failed to initialize payment',
+      details: error?.response?.data || error.message,
+    });
+  }
+});
+
+router.get('/verify/:reference', async (req, res) => {
+  const { reference } = req.params;
+  try {
+    const response = await paystackApi.get(`/transaction/verify/${reference}`);
+    res.json(response.data);
+  } catch (error: any) {
+    res.status(500).json({
+      error: 'Failed to verify payment',
+      details: error?.response?.data || error.message,
+    });
+  }
+});
+
+router.post('/plan', async (req, res) => {
+  const { name, amount, interval } = req.body;
+  try {
+    const response = await paystackApi.post('/plan', {
+      name,
+      amount: Math.round(amount * 100),
+      interval,
+      currency: "NGN",
+    });
+    res.json(response.data);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Plan creation failed', details: error?.response?.data || error.message });
+  }
+});
+
+router.post('/subscribe', async (req, res) => {
+  const { email, plan_code } = req.body;
+  try {
+    const response = await paystackApi.post('/subscription', {
+      customer: email,
+      plan: plan_code,
+    });
+    res.json(response.data);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Subscription failed', details: error?.response?.data || error.message });
+  }
+});
+
+router.post('/transfer', async (req, res) => {
+  const { amount, recipient_code, reason } = req.body;
+  try {
+    const response = await paystackApi.post('/transfer', {
+      source: 'balance',
+      amount: Math.round(amount * 100),
+      recipient: recipient_code,
+      reason,
+    });
+    res.json(response.data);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Transfer failed', details: error?.response?.data || error.message });
+  }
+});
+
+router.post('/webhook', express.json({ type: '*/*' }), async (req, res) => {
+  const paystackSignature = req.headers['x-paystack-signature'];
+  const secret = process.env.PAYSTACK_SECRET_KEY;
+  const hash = crypto.createHmac('sha512', secret!).update(JSON.stringify(req.body)).digest('hex');
+  if (hash !== paystackSignature) return res.status(403).send('Invalid signature');
+  await handlePaystackWebhook(req.body);
+  res.sendStatus(200);
+});
+
+export default router;
+```
+
+---
+
+## 10. File Upload Route
+
+```typescript name=server/routes/upload.ts
+import express from 'express';
+import multer from 'multer';
+import cloudinary from '../config/cloudinary';
+import { Readable } from 'stream';
+
+const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage() });
+
+router.post('/', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file provided' });
+    }
+    const stream = Readable.from(req.file.buffer);
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        {
+          resource_type: 'auto',
+          folder: 'dobble-tap',
+          transformation: [
+            { width: 1000, height: 1000, crop: 'limit' },
+            { quality: 'auto' }
+          ]
+        },
+        (error, result) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(result);
+          }
+        }
+      );
+      stream.pipe(uploadStream);
+    });
+    res.json({
+      url: (result as any).secure_url,
+      public_id: (result as any).public_id
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+router.delete('/:publicId', async (req, res) => {
+  try {
+    const { publicId } = req.params;
+    const result = await cloudinary.uploader.destroy(publicId);
+    res.json({ result });
+  } catch (error) {
+    res.status(500).json({ error: 'Delete failed' });
+  }
+});
+
+export default router;
+```
+
+---
+
+## 11. Notification Context (Frontend UI)
+
+```tsx name=client/src/context/NotificationContext.tsx
+import React, { createContext, useContext, useState } from 'react';
+
+type Notification = { message: string, type: 'success' | 'error' | 'info' };
+
+const NotificationContext = createContext<{ notify: (n: Notification) => void } | undefined>(undefined);
+
+export function useNotification() {
+  return useContext(NotificationContext)!;
+}
+
+export function NotificationProvider({ children }: { children: React.ReactNode }) {
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const notify = (n: Notification) => setNotifications([...notifications, n]);
+  return (
+    <NotificationContext.Provider value={{ notify }}>
+      {children}
+      <div className="fixed top-4 right-4 z-50">
+        {notifications.map((n, i) => (
+          <div key={i} className={`alert alert-${n.type}`}>
+            {n.message}
+          </div>
+        ))}
+      </div>
+    </NotificationContext.Provider>
+  );
+}
+```
+
+---
+
+## 12. Notification Bell + Polling
+
+```tsx name=client/src/components/NotificationBell.tsx
+import React, { useEffect, useState } from 'react';
+
+export function NotificationBell() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    const fetchCount = () => {
+      fetch('/api/notifications/unread-count')
+        .then(res => res.json())
+        .then(data => setCount(data.count));
+    };
+    fetchCount();
+    const interval = setInterval(fetchCount, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <button>
+      <span role="img" aria-label="bell">🔔</span>
+      {count > 0 && <span className="badge">{count}</span>}
+    </button>
+  );
+}
+```
+
+---
+
+## 13. File Upload UI (Frontend)
+
+```tsx name=client/src/components/ui/file-upload.tsx
+import React, { useState, useRef } from 'react';
+import { Button } from './button';
+import { Progress } from './progress';
+import { Upload, X, Image, FileText } from 'lucide-react';
+import { useToast } from '@/hooks/use-toast';
+
+interface FileUploadProps {
+  onUpload: (url: string, publicId: string) => void;
+  acceptedTypes?: string;
+  maxSize?: number;
+  className?: string;
+  placeholder?: string;
+}
+
+export function FileUpload({
+  onUpload,
+  acceptedTypes = "image/*",
+  maxSize = 5,
+  className = "",
+  placeholder = "Click to upload or drag and drop"
+}: FileUploadProps) {
+  const [uploading, setUploading] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [preview, setPreview] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const { toast } = useToast();
+
+  const validateFile = (file: File): boolean => {
+    if (file.size > maxSize * 1024 * 1024) {
+      toast({
+        title: "File too large",
+        description: `File size must be less than ${maxSize}MB`,
+        variant: "destructive",
+      });
+      return false;
+    }
+    return true;
+  };
+
+  const uploadFile = async (file: File) => {
+    if (!validateFile(file)) return;
+    setUploading(true);
+    setProgress(0);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const progressInterval = setInterval(() => {
+        setProgress(prev => Math.min(prev + 10, 90));
+      }, 200);
+
+      const response = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData,
+      });
+
+      clearInterval(progressInterval);
+      setProgress(100);
+
+      if (!response.ok) throw new Error('Upload failed');
+      const data = await response.json();
+
+      if (file.type.startsWith('image/')) setPreview(data.url);
+      onUpload(data.url, data.public_id);
+
+      toast({
+        title: "Upload successful",
+        description: "Your file has been uploaded successfully",
+      });
+    } catch (error) {
+      toast({
+        title: "Upload failed",
+        description: "There was an error uploading your file",
+        variant: "destructive",
+      });
+    } finally {
+      setUploading(false);
+      setProgress(0);
+    }
+  };
+
+  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) uploadFile(file);
+  };
+
+  const handleDrop = (event: React.DragEvent) => {
+    event.preventDefault();
+    setDragOver(false);
+
+    const file = event.dataTransfer.files[0];
+    if (file) uploadFile(file);
+  };
+
+  const handleDragOver = (event: React.DragEvent) => {
+    event.preventDefault();
+    setDragOver(true);
+  };
+
+  const handleDragLeave = () => setDragOver(false);
+
+  const removePreview = () => {
+    setPreview(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  return (
+    <div className={`space-y-4 ${className}`}>
+      <div
+        className={`
+          relative border-2 border-dashed rounded-lg p-6 text-center cursor-pointer
+          transition-colors duration-200
+          ${dragOver ? 'border-blue-600 bg-blue-50' : 'border-gray-300 hover:border-gray-400'}
+          ${uploading ? 'pointer-events-none opacity-50' : ''}
+        `}
+        onDrop={handleDrop}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onClick={() => fileInputRef.current?.click()}
+      >
+        <input
+          ref={fileInputRef}
+          type="file"
+          className="hidden"
+          accept={acceptedTypes}
+          onChange={handleFileSelect}
+          disabled={uploading}
+        />
+        {preview ? (
+          <div className="relative">
+            <img
+              src={preview}
+              alt="Preview"
+              className="mx-auto max-h-32 rounded"
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              className="absolute top-2 right-2"
+              onClick={e => {
+                e.stopPropagation();
+                removePreview();
+              }}
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {acceptedTypes.includes('image') ? (
+              <Image className="mx-auto h-12 w-12 text-gray-400" />
+            ) : (
+              <FileText className="mx-auto h-12 w-12 text-gray-400" />
+            )}
+            <div>
+              <p className="text-lg font-medium">
+                {uploading ? 'Uploading...' : placeholder}
+              </p>
+              <p className="text-sm text-gray-500">
+                {acceptedTypes.includes('image') ? 'PNG, JPG, GIF up to' : 'Files up to'} {maxSize}MB
+              </p>
+            </div>
+            {!uploading && (
+              <Button variant="outline" className="mt-2">
+                <Upload className="h-4 w-4 mr-2" />
+                Choose File
+              </Button>
+            )}
+          </div>
+        )}
+        {uploading && (
+          <div className="mt-4">
+            <Progress value={progress} className="w-full" />
+            <p className="text-sm text-gray-500 mt-1">{progress}%</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default FileUpload;
+```
+
+---
+
+## 14. Profile Page UI
+
+```tsx name=client/src/pages/ProfilePage.tsx
+import React, { useState, useEffect } from 'react';
+import FileUpload from '@/components/ui/file-upload';
+import { useNotification } from '@/context/NotificationContext';
+import NotificationBell from '@/components/NotificationBell';
+
+export default function ProfilePage() {
+  const [user, setUser] = useState<any>(null);
+  const { notify } = useNotification();
+
+  useEffect(() => {
+    fetch('/api/user/me')
+      .then(res => res.json())
+      .then(setUser);
+  }, []);
+
+  const handleAvatarUpload = async (url: string, publicId: string) => {
+    await fetch('/api/user/avatar', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ avatar: url }),
+    });
+    notify({ message: 'Profile picture updated!', type: 'success' });
+    setUser({ ...user, avatar: url });
+  };
+
+  if (!user) return <div>Loading...</div>;
+  return (
+    <div className="max-w-xl mx-auto space-y-8">
+      <NotificationBell />
+      <div className="flex items-center space-x-4">
+        <img src={user.avatar} className="w-16 h-16 rounded-full" alt="Avatar" />
+        <div>
+          <h2 className="text-xl font-bold">{user.name}</h2>
+          <p className="text-gray-500">@{user.username}</p>
+        </div>
+      </div>
+      <FileUpload
+        onUpload={handleAvatarUpload}
+        acceptedTypes="image/*"
+        maxSize={2}
+        placeholder="Upload a new profile picture"
+      />
+      <div className="grid grid-cols-2 gap-4">
+        <div className="p-4 bg-white rounded shadow">
+          <div className="text-xs text-gray-500">Balance</div>
+          <div className="text-lg font-bold">₦{user.balance}</div>
+        </div>
+        <div className="p-4 bg-white rounded shadow">
+          <div className="text-xs text-gray-500">Total Earnings</div>
+          <div className="text-lg font-bold">₦{user.totalEarnings}</div>
+        </div>
+        <div className="p-4 bg-white rounded shadow">
+          <div className="text-xs text-gray-500">Completed Campaigns</div>
+          <div className="text-lg font-bold">{user.completedCampaigns}</div>
+        </div>
+        <div className="p-4 bg-white rounded shadow">
+          <div className="text-xs text-gray-500">Active Campaigns</div>
+          <div className="text-lg font-bold">{user.activeCampaigns}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+---
+
+## 15. Campaign List UI
+
+```tsx name=client/src/pages/CampaignList.tsx
+import React, { useEffect, useState } from 'react';
+
+export default function CampaignList() {
+  const [campaigns, setCampaigns] = useState([]);
+  useEffect(() => {
+    fetch('/api/campaigns')
+      .then(res => res.json())
+      .then(setCampaigns);
+  }, []);
+  return (
+    <div className="max-w-4xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-8">
+      {campaigns.map((c: any) => (
+        <div key={c.id} className="bg-white rounded-lg shadow p-6 flex flex-col space-y-2">
+          <div className="flex items-center space-x-2">
+            <img src={c.brandLogo} className="w-8 h-8 rounded" alt={c.brandName} />
+            <span className="font-bold">{c.brandName}</span>
+            <span className={`ml-auto badge badge-${c.status}`}>{c.status}</span>
+          </div>
+          <h3 className="text-lg font-semibold">{c.title}</h3>
+          <p className="text-gray-600">{c.description}</p>
+          <div className="mt-auto flex justify-between items-center">
+            <span className="font-bold text-green-600">₦{c.reward}</span>
+            <span className="text-xs text-gray-400">Due: {new Date(c.dueDate).toLocaleDateString()}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+---
+
+## 16. Paystack Payment UI
+
+```tsx name=client/src/components/PaystackPayment.tsx
+import React from 'react';
+
+export function PaystackPayment({ email, amount, metadata }) {
+  const handlePay = async () => {
+    const response = await fetch('/api/payments/initialize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, amount, metadata }),
+    });
+    if (!response.ok) return alert('Failed');
+    const data = await response.json();
+    window.location.href = data.authorization_url;
+  };
+  return (
+    <button onClick={handlePay} className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded">
+      Pay ₦{amount} with Paystack
+    </button>
+  );
+}
+```
+
+---
+
+## 17. Render Deployment Script
+
+```yaml name=render.yaml
+services:
+- type: web
+  name: dobbletap-backend
+  env: node
+  buildCommand: npm install && npm run build
+  startCommand: npm run start
+  repo: https://github.com/yourorg/dobbletap
+  branch: main
+  envVars:
+    - key: NODE_ENV
+      value: production
+    - key: DATABASE_URL
+      sync: false
+    - key: CLOUDINARY_CLOUD_NAME
+      sync: false
+    - key: CLOUDINARY_API_KEY
+      sync: false
+    - key: CLOUDINARY_API_SECRET
+      sync: false
+    - key: PAYSTACK_SECRET_KEY
+      sync: false
+    - key: RESEND_API_KEY
+      sync: false
+    - key: JWT_SECRET
+      sync: false
+```
+
+---
+
+## 18. Vercel Deployment Script
+
+```json name=vercel.json
+{
+  "version": 2,
+  "builds": [
+    { "src": "package.json", "use": "@vercel/node" }
+  ],
+  "routes": [
+    { "src": "/api/(.*)", "dest": "api/$1.js" },
+    { "src": "/(.*)", "dest": "/index.html" }
+  ],
+  "env": {
+    "NEXT_PUBLIC_API_URL": "https://dobbletap-backend.onrender.com",
+    "NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME": "your-cloudinary-cloud-name"
+  }
+}
+```
+
+---
+
+## 19. Production Deployment Checklist
+
+```markdown name=DEPLOYMENT_CHECKLIST.md
+# Production Deployment Checklist
+
+## Environment Variables
+- [ ] All keys/secrets set (.env)
+- [ ] Secure random JWT secret
+- [ ] Database connection string (Neon/Supabase)
+
+## Security
+- [ ] HTTPS enforced
+- [ ] CORS configured appropriately
+- [ ] Input validation/sanitization
+- [ ] Secure headers (helmet, etc.)
+- [ ] Rate limiting enabled
+
+## Backend
+- [ ] Error handling middleware
+- [ ] Logging (structured, error, access)
+- [ ] Webhook endpoints (Paystack, Resend)
+- [ ] Health check endpoint
+
+## Frontend
+- [ ] Error boundary
+- [ ] Responsive/mobile support
+- [ ] User feedback (toasts, notifications)
+- [ ] Proper loading states
+
+## Payments
+- [ ] Paystack live keys
+- [ ] Payment verification logic
+- [ ] Webhook events processed and logged
+
+## Emails
+- [ ] Resend live API key
+- [ ] Email templates for all cases (welcome, reset, payment, notifications)
+- [ ] DKIM, SPF set up for sender domain
+
+## Monitoring
+- [ ] Uptime monitoring (Pingdom, UptimeRobot, etc.)
+- [ ] Error tracking (Sentry, LogRocket, etc.)
+
+## Deployment
+- [ ] Backend on Render (or preferred host)
+- [ ] Frontend on Vercel
+- [ ] Static assets (images, uploads) on Cloudinary
+- [ ] Custom domain configured
+
+## Documentation
+- [ ] README updated
+- [ ] API docs (Swagger, Postman, etc.)
+- [ ] Developer onboarding guide
+
+## Final Checks
+- [ ] Test all critical flows (auth, upload, payment, email)
+- [ ] Test webhooks (with real events)
+- [ ] Regression test for UI/UX
+```
